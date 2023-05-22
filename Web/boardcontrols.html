@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta name="viewport" content="user-scalable=no, initial-scale=1, maximum-scale=1, minimum-scale=1, width=device-width, height=device-height, target-densitydpi=device-dpi" />
+        <title>Game Master</title>
+        <style>
+body, html { height:100%; }
+
+canvas {
+    position:absolute;
+    width:100%;
+    height:100%;
+}
+
+html, body, div, canvas {
+    margin: 0;
+    padding: 0;
+}
+
+        </style>
+    </head>
+<body>
+
+<canvas id="canvas", width = "100%", height = "100%">
+Your browser does not support the HTML canvas tag.</canvas>
+
+<script>
+
+    // use for compressing the webpage
+    // https://gchq.github.io/CyberChef/#recipe=Gzip('Dynamic%20Huffman%20Coding','index.html.gz','',false)To_Hex('0x',0)Split('0x',',0x')
+    
+let canvas, c //= document.getElementById("canvas")
+let dpr //pixel density
+let ongoingTouches = []
+let usedTouches = []
+const halfPI = Math.PI / 2
+const eightPI = Math.PI / 8
+const maxMemory = 7
+
+const fields = 
+[
+{id: 1, name: "One Minute Pitch"},
+{id: 2, name: "Lego Challenge"},
+{id: 3, name: "Selfies"},
+{id: 4, name: "Mouth Full"},
+{id: 5, name: "Karaoke"},
+{id: 6, name: "Meet & Greet"},
+{id: 7, name: "Kareltje"},
+{id: 8, name: "Serenade"}
+]
+const fieldangle = (Math.PI * 2) / fields.length
+let turns = []
+let turnsupdated = false
+
+let lastText, lastSend, sendTimeout
+
+document.addEventListener("DOMContentLoaded", startup)
+//document.onfullscreenchange = handleFullScreenChange
+
+let board
+
+const view = document.getElementById('stream')
+const WS_URL = "ws://" + window.location.host + ":82"
+//let ws
+const ws = new WebSocket(WS_URL)
+ws.onmessage = message => 
+{
+    let data = message.data
+    console.log(data)
+    let header = data.charAt(0)
+    if (header == 'u') updateView(data)
+    if (header == 't') updateTarget(data)
+
+}
+function updateTarget(data)
+{
+    board.target = parseInt(data.slice(-(data.length - 1)))
+    console.log(board.target)
+}
+
+function updateView(data)
+{
+    let b_fields = []
+    let a_field = []
+    let sequence = []
+    let current = 'n'
+    for (let i = 1; i < data.length; i++)
+    {
+        let c = data.charAt(i)
+        if (c == 'a' || c == 'q') 
+        {
+            if (current == 'q') 
+            {
+                b_fields.push(sequence)
+                sequence = []
+            }
+            current = c
+            continue
+        }
+        if (current == 'a') a_field.push(parseInt(c))
+        if (current == 'q') sequence.push(parseInt(c))
+    }
+    if (current == 'q') b_fields.push(sequence)
+    if (a_field.length > 0) board.visibleSequence = a_field
+    if (b_fields.length > 0) updateTurns(b_fields)
+    console.log(a_field)
+    console.log(b_fields)
+}
+
+
+function TurnTile(turn, sequence)
+{
+    this.turn = turn
+    this.dia = 25
+    this.baseline = canvas.height - 200
+    this.spacing = 55
+    this.targetpos = {x: (canvas.width / 2) + ((this.turn - 0.5) * this.spacing) - (turns.length * this.spacing) / 2, y : this.baseline}
+    this.pos = {x: this.targetpos.x, y: this.targetpos.y}
+    this.dragging = false
+    this.highlighted = false
+    this.sequence = sequence
+    this.toDelete = false
+    this.prio = false
+
+    if (sequence.length == 0) 
+    {
+        for (let i = 1; i < fields.length + 1; i++) {
+            sequence.push(i)
+        }
+    }
+
+    this.inBounds = function(t)
+    {
+        return dist(this.pos.x, this.pos.y, t.x, t.y) < this.dia
+    }
+
+    this.center = function()
+    {
+        //best way to center would be to send the count
+        let w = turns.length * this.spacing
+        this.targetpos.x = (canvas.width / 2) + ((this.turn - 0.5) * this.spacing) - w / 2
+    }
+    this.bounce = function(target, factor)
+    {
+        this.pos.x += (target.x - this.pos.x) * factor
+        this.pos.y += (target.y - this.pos.y) * factor
+    }
+    this.initDrag = function(t)
+    {
+        usedTouches.push(t.identifier)
+        //this.highlighted = true
+        this.dragging = true
+    }
+    this.updateTurn = function(turn)
+    {
+        this.turn = turn
+        this.targetpos = {x: this.xmin + turn * this.spacing, y : this.baseline}
+    }
+    this.getDragStatus = function(t)
+    {
+        // if prioritizing (moving up from list)
+
+        if (board.inBounds(t)) return {state: 'prio'}
+        if (t.y < this.baseline - 50) return {state: 'tracktouch'}
+        else if (t.y > this.baseline + 50) return {state: 'delete', color: getColor(255, 0, 0, (t.y - this.baseline) / (canvas.height - this.baseline))}
+        return {state: 'shuffle'}
+    }
+    this.markPrio = function()
+    {
+        this.prio = true
+        c.fillStyle = getColor(0, 255, 0, 0.5)
+        c.beginPath()
+        c.arc(board.xpos, board.ypos, board.dia, 0, 2 * Math.PI)
+        c.closePath()
+        c.fill()
+    }
+    this.markDelete = function(fieldcolor)
+    {
+        this.toDelete = true
+        c.fillStyle = fieldcolor
+        c.fillRect(0, this.baseline + 50, canvas.width, canvas.height) //red field
+    }
+    this.update = function()
+    {
+        let touchfound = false
+        for (let t of ongoingTouches)
+        {
+            touchfound = true
+            if (this.inBounds(t) && !used(t.identifier)) this.initDrag(t)
+            if (this.dragging) 
+            {
+                let status = this.getDragStatus(t)
+                //console.log(status)
+                if (status.state == 'prio') 
+                {
+                    this.markPrio()
+                    this.bounce(t, 0.5)
+                }
+                else if (status.state == 'tracktouch')
+                {
+                    this.prio = false
+                    this.toDelete = false
+                    this.bounce(t, 0.5)
+                }
+                else if (status.state == 'delete') 
+                {
+                    this.bounce(t, 0.5)
+                    this.markDelete(status.color)
+                }
+                else 
+                {
+                    this.prio = false
+                    this.toDelete = false
+                    this.bounce({x: t.x, y: this.baseline}, 0.5)
+                }
+            }
+        }
+        if (!touchfound) 
+        {
+            //console.log("no touch", this.targetpos)
+            this.bounce(this.targetpos, 0.2)
+            this.dragging = false
+        }
+        return touchfound
+    }
+    this.draw = function()
+    {
+        for (let i = 0; i < fields.length; i++)
+        {
+            let field = i + 1
+            let rot1 = (Math.PI * 2 / fields.length) *  (field - 1) - halfPI
+            let rot2 = (Math.PI * 2 / fields.length) * (field) - halfPI
+        //console.log(rot1, rot2)
+        let x1 = this.pos.x + Math.cos(rot1) * this.dia
+        let y1 = this.pos.y + Math.sin(rot1) * this.dia
+        let x2 = this.pos.x + Math.cos(rot2) * this.dia
+        let y2 = this.pos.y + Math.sin(rot2) * this.dia
+        let odd = (field.id % 2 == 0)
+        c.fillStyle = inList(field, this.sequence) ? 'rgba(0, 255, 0, 1)' : 'rgba(255, 0, 0, 1)'
+        //c.strokeStyle = 'rgba(0,0,0,1.0)'
+        c.beginPath()
+        c.moveTo(this.pos.x, this.pos.y)
+        c.lineTo(x1, y1)
+        c.arc(this.pos.x, this.pos.y, this.dia, rot1, rot2, false)
+        c.closePath()
+        c.fill()
+        }
+        c.textAlign = "center"
+        c.fillStyle = 'rgba(255,255,255,1.0)'
+        c.font = '30px Arial'
+        c.fillText(this.turn, this.pos.x, this.pos.y + this.dia * 2)
+    }
+}
+
+function Board(xpos, ypos, dia)
+{
+    this.xpos = xpos
+    this.ypos = ypos
+    this.dia = dia
+    this.sequence = []
+    this.visibleSequence = []
+    this.turn = 0
+    this.drawing = false
+    this.black = 'rgba(51, 51, 51, 1)'
+    this.white = 'rgba(200, 200, 200, 1)'
+    this.grey = 'rgba(120, 120, 120, 1)'
+    this.rot = 0
+    this.spinning = false
+    this.border = 30
+    this.target = 0
+
+    this.draw = function()
+    {
+        for(let field of fields)
+        {
+            this.drawSlice(field)
+        }
+        c.fillStyle = this.grey
+        c.strokeStyle = "rgba(0,0,0,0.5)"
+        c.beginPath()
+        c.arc(this.xpos, this.ypos, this.dia / 3, 0, 2 * Math.PI)
+        c.closePath()
+        c.fill()
+        c.stroke()
+        this.showTurn()
+        this.drawRail()
+    }
+    this.newSequence = function(field, free)
+    {
+        this.sequence = []
+        //console.log(free)
+        if (!free) this.sequence.push(field.id)
+        //console.log(fields)
+        this.turn ++
+        console.log("new sequence")
+        console.log(this.sequence)
+        this.drawing = true
+    }
+    this.showTurn = function()
+    {
+        //shows what the board is working on
+        for (let i = 0; i < fields.length; i++)
+        {
+            let field = i + 1
+            let rot1 = (Math.PI * 2 / fields.length) *  (field - 1) - halfPI + this.rot
+            let rot2 =  rot1 + fieldangle
+            let x1 = this.xpos + Math.cos(rot1) * this.dia
+            let y1 = this.ypos + Math.sin(rot1) * this.dia
+            let x2 = this.xpos + Math.cos(rot2) * this.dia
+            let y2 = this.ypos + Math.sin(rot2) * this.dia
+            let odd = (field.id % 2 == 0)
+            c.fillStyle = inList(field, this.visibleSequence) ? 'rgba(0, 255, 0, 0.3)' : 'rgba(255, 0, 0, 0.3)'
+            c.beginPath()
+            c.moveTo(this.xpos, this.ypos)
+            c.lineTo(x1, y1)
+            c.arc(this.xpos, this.ypos, this.dia / 3, rot1, rot2, false)
+            c.closePath()
+            c.fill()
+        }
+    }
+    this.onFreeSpot = function(t)
+    {
+        return dist(this.xpos, this.ypos, t.x, t.y) < this.dia / 3
+    }
+    this.onHandle = function(t)
+    {
+        return isAbout(dist(this.xpos, this.ypos, t.x, t.y), this.dia + this.border, 15)
+    }
+    this.update = function()
+    {
+        let touchfound = false
+        for (let t of ongoingTouches)
+        {
+            touchfound = true
+            if (this.drawing) 
+            {
+                if (this.onFreeSpot(t)) continue
+                let field = this.getField(t)
+                let visited = inList(field.id, this.sequence)
+                //console.log(visited)
+                if (field != -1 && !visited) this.sequence.push(field.id)
+            }
+            else if (this.spinning)
+            {
+                let spin = Math.atan2(t.y - this.ypos, t.x - this.xpos)
+                this.rot += spin - this.pSpin
+                //this.rot = posAngle(this.rot)
+                this.pSpin = spin
+            }
+            else if ((this.inBounds(t)) && !used(t.identifier)) //it's a new touch, or we're drawing
+            {
+                let field = this.getField(t)
+                // I pressed in a field
+                if ((field != -1)) this.newSequence(field, this.onFreeSpot(t))
+                usedTouches.push(t.identifier)
+            }
+            else if (this.onHandle(t) && !used(t.identifier))
+            {
+                //on handle, spin it
+                this.spinning = true
+                this.pSpin = Math.atan2(t.y - this.ypos, t.x - this.xpos)
+                usedTouches.push(t.identifier)
+            }
+        }
+        if (!touchfound && (this.drawing)) 
+        {
+            this.drawing = false
+            return 'drawend'
+        }
+        if (!touchfound && (this.spinning)) 
+        {
+            this.spinning = false
+            return 'spinend'
+        }
+        return false
+    }
+    
+    this.getField = function(t)
+    {
+        //get the angle of the touch
+        let angle = posAngle(Math.atan2(t.y - this.ypos, t.x - this.xpos))
+        for (let field of fields)
+        {
+            let rot1 = posAngle((1 / fields.length) * Math.PI * 2 * (field.id - 1) - halfPI + this.rot)
+            let rot2 = posAngle(rot1 + fieldangle)
+            if (angle < fieldangle) rot1 = rot2 - fieldangle
+            else if (angle > Math.PI * 2 - fieldangle) rot2 = rot1 + fieldangle
+            if (angle > rot1 && angle < rot2) return field
+        }
+        return -1 //failed
+    }
+    this.inBounds = function(touch)
+    {
+        return dist(this.xpos, this.ypos, touch.x, touch.y) < this.dia
+    }
+
+    this.drawRail = function()
+    {
+    c.save()
+    c.translate(this.xpos, this.ypos)
+    c.rotate(this.rot)
+    let odd = false
+    c.lineWidth = 10
+    let step = eightPI / 4
+    for (let i = step / 2; i < Math.PI * 2; i += step)
+    {  
+        c.strokeStyle = odd ? getColor(0,0,0,0.2) : getColor(0,0,0,0)
+        odd = !odd
+        c.beginPath()
+        c.arc(0, 0, this.dia + this.border, i, i + step)
+        c.stroke()
+    }
+    c.restore()
+    }
+
+    this.drawSlice = function(field)
+    {
+        let rot1 = ((Math.PI * 2 / fields.length) *  (field.id - 1) - halfPI) + this.rot
+        let rot2 = ((Math.PI * 2 / fields.length) * (field.id) - halfPI) + this.rot
+        //console.log(rot1, rot2)
+        let x1 = this.xpos + Math.cos(rot1) * this.dia
+        let y1 = this.ypos + Math.sin(rot1) * this.dia
+        let x2 = this.xpos + Math.cos(rot2) * this.dia
+        let y2 = this.ypos + Math.sin(rot2) * this.dia
+        let odd = (field.id % 2 == 0)
+        c.fillStyle = odd ? this.black : this.white
+        c.strokeStyle = 'rgba(0,0,0,1.0)'
+        c.beginPath()
+        c.moveTo(this.xpos, this.ypos)
+        c.lineTo(x1, y1)
+        c.arc(this.xpos, this.ypos, this.dia, rot1, rot2, false)
+        c.closePath()
+        c.fill()
+        c.stroke()
+        //draw green haze
+        c.fillStyle = inList(field.id, this.sequence) ? 'rgba(0, 255, 0, 0.35)' : 'rgba(0,0,0,0)'
+        c.beginPath()
+        c.moveTo(this.xpos, this.ypos)
+        c.lineTo(x1, y1)
+        c.arc(this.xpos, this.ypos, this.dia, rot1, rot2, false)
+        c.closePath()
+        c.fill()
+
+        let rot = (rot1 + rot2) / 2
+        let txt_x = this.xpos + Math.cos(rot) * (this.dia / 1.2)
+        let txt_y = this.ypos + Math.sin(rot) * (this.dia / 1.2)
+
+        c.save()
+        c.translate(txt_x, txt_y)
+        c.rotate(rot + halfPI)
+        c.textAlign = "center"
+
+        c.fillStyle = odd ? this.white : this.black
+        c.font = '14px Arial'
+        //console.log(field.name)
+        c.fillText(field.name, 0, 0)
+        c.font = '20px Arial'
+        c.fillText(field.id, 0, 30)
+        c.restore()
+    }
+    
+}
+
+function sameSequence(t1, t2) 
+{
+    if (t1.length != t2.length) return false
+    for (let i in t1)
+    {
+        if (t1[i] != t2[i]) return false
+    }
+    return true
+}
+
+function updateTurns(b_fields)
+{
+    let over = turns.length - b_fields.length
+    if (over > 0) 
+    {
+        turns.splice(b_fields.length, over)
+        for (let i in b_fields)
+        {
+            turns[i].sequence = b_fields[i]
+        }
+    }
+    if (over < 0)
+    {
+        for (let i in turns)
+        {
+            turns[i].sequence = b_fields[i]
+        }
+        for (let i = turns.length; i < b_fields.length; i++)
+        {
+            turns.push(new TurnTile(turns.length + 1, b_fields[i]))
+        }
+    }
+    orderTurns()
+}
+function handleTurns()
+{
+    //console.log(turns)
+    let turnupdate = false
+    let turnorder = []
+    let hasTouch = false
+    let forceupdate = false
+    let forcespin = false
+    for (let i = turns.length - 1; i >= 0; i--)
+    {
+        let turn = turns[i]
+        if (turn.update()) hasTouch = true
+        turn.draw()
+        if (!turn.dragging)
+        {
+            if (turn.toDelete) 
+            {
+                turns.splice(i, 1)
+                turnupdate = true
+                forceupdate = true
+            }
+            else if (turn.prio)
+            {
+                board.visibleSequence = turn.sequence
+                turns.splice(i, 1)
+                forcespin = true
+                forceupdate = true
+                turnupdate = true
+            }
+        }
+        else 
+        {
+            let before = getTurnAt(turn, -1)
+            let after = getTurnAt(turn, 1)
+            if (before !== -1)
+            {
+                if (turn.pos.x <= before.pos.x) 
+                {
+                    let copy = turn.turn
+                    turn.updateTurn(before.turn)
+                    before.updateTurn(copy)
+                    turnsupdated = true
+                    turnupdate = true
+                }
+            }
+            if (after !== -1)
+            {
+                if (turn.pos.x > after.pos.x) 
+                {
+                    let copy = turn.turn
+                    turn.updateTurn(after.turn)
+                    after.updateTurn(copy)
+                    turnsupdated = true
+                    turnupdate = true
+                }
+            }
+        }
+    }
+    if (turnupdate) orderTurns() //visually update
+    if (!hasTouch) //not handling anything
+    {
+        if (forceupdate) return getTurnOrder(forcespin)
+        if (turnsupdated)
+        {
+            turnsupdated = false
+            return getTurnOrder(forcespin)
+        }
+    }
+    return false
+}
+
+function orderTurns()
+{
+for (let turn of turns)
+    {
+        let count = 1
+        for (let other of turns)
+        {
+            if (other.turn == turn.turn) continue
+            if (other.pos.x < turn.pos.x) count ++
+        }
+        turn.updateTurn(count)
+        turn.center()
+    }
+}
+function getTurnOrder(forcespin)
+{
+    turnorder = []
+    if (forcespin) turnorder.push({type: "force", sequence: board.visibleSequence})
+    for (let i = 0; i < turns.length; i ++)
+        {
+            for (let turn of turns)
+            {
+                if (i + 1 == turn.turn) turnorder.push({type: "spin", sequence: turn.sequence})
+            }
+        }
+    return turnorder
+}
+
+function requestSpin()
+{
+    out = "r"
+    out += Math.floor(posAngle(board.rot) * 57.2957)
+    return out
+}
+// main function
+function update()
+{
+    c.fillStyle = "rgba(51, 51, 51, 1)"
+    c.fillRect(0, 0, canvas.width, canvas.height) //background
+    updateUsed() //update touches
+    //drawTurns()
+    let boardstate = board.update()
+    if (boardstate == 'drawend') 
+    {
+        if (turns.length <= maxMemory) 
+        {
+            turns.push(new TurnTile(turns.length + 1, board.sequence))
+            orderTurns()
+            updateBoard(getTurnOrder())
+        }
+        board.sequence = []
+    }
+    else if (boardstate == 'spinend') requestSpin()
+    //draw the board
+    board.draw()
+    let plannedTurns = handleTurns() //true if update is needed
+    //console.log(plannedTurns)
+    if (plannedTurns) updateBoard(plannedTurns)
+}
+
+function encode(plannedTurns)
+{
+    let out = ""
+    for (let turn of plannedTurns)
+    {
+        let line = ""
+        if (turn.type == 'force') line += "a"
+        else line += 'q'
+        for (entry of turn.sequence)
+        {
+            line += entry
+        }
+        line += ','
+        out += line
+    }
+    return out
+}
+function updateBoard(plannedTurns) {
+    let txt = encode(plannedTurns)
+    console.log('msg: ', txt)
+    send(txt)
+}
+
+function send(txt)
+{
+    let now = new Date().getTime()
+    if (lastSend === undefined || now - lastSend >= 30) 
+    {
+        console.log('Sending')
+        try 
+        {
+            ws.send(txt)
+            lastSend = new Date().getTime()
+            return
+        } 
+        catch (e) 
+        {
+            //console.log(e)
+        }
+    }
+    lastText = txt
+    if (!sendTimeout) {
+        var ms = lastSend !== undefined ? 30 - (now - lastSend) : 30
+        if (ms < 0)
+            ms = 0
+        sendTimeout = setTimeout(() => {
+            sendTimeout = null
+            send(lastText)
+        }, ms)
+    }   
+}
+function startup() {
+    canvas = document.getElementById("canvas")
+
+    canvas.width = window.innerWidth
+    canvas.height = window.innerHeight
+    console.log(canvas.width, canvas.height)
+
+    c = canvas.getContext("2d")
+
+    //create a board instance
+    let dia = canvas.height > canvas.width ? canvas.width / 2.5 : canvas.height / 2.5
+    board = new Board(canvas.width / 2, (canvas.height / 2) - 100, dia)
+    send('s')
+
+    //connectWS()
+
+    setInterval(update, 40)
+
+    canvas.addEventListener("touchstart", handleStart, false)
+    canvas.addEventListener("touchend", handleEnd, false)
+    canvas.addEventListener("touchcancel", handleCancel, false)
+    canvas.addEventListener("touchmove", handleMove, false)
+
+  }
+
+  function inList(a, list)
+  {
+      for (let el of list)
+      {
+        if (a === el) return true
+      }
+      return false
+  }
+
+  function dist(x1, y1, x2, y2)
+  {
+    let dx = x1 - x2
+    let dy = y1 - y2
+    return Math.sqrt((dx * dx) + (dy * dy))
+  }
+
+  function posAngle(angle)
+{
+     return (Math.PI * 2 + (angle % (Math.PI * 2))) % (Math.PI * 2)
+}
+
+function map(val, preMin, preMax, newMin, newMax)
+{
+return (val - preMin) * (newMax - newMin) / (preMax - preMin) + newMin
+}
+
+function getTurnAt(turn, pos)
+{
+    for (let t of turns)
+    {
+        if (t.turn - turn.turn == pos) return t
+    }
+    return -1
+}
+function isAbout(x, y, error)
+{
+    return (x >= y - error && x <= y + error)
+}
+
+function used(touchID)
+  {
+    for (let tID of usedTouches)
+    {
+        if (touchID === tID) return true
+    }
+    return false
+  }
+
+  function updateUsed()
+  {
+    for (let i = 0; i < usedTouches.length; i++)
+        {
+            let found = false
+            for (let t of ongoingTouches)
+            {
+                if (t.identifier === usedTouches[i])
+                {
+                    found = true
+                    break
+                }
+            }
+            if (!found) usedTouches.splice(i, 1)
+        }
+  }
+
+  // create a touch instance
+  function handleStart(evt) {
+    evt.preventDefault()
+    //fullscreen()
+    //console.log("touchstart.");
+    let touches = evt.changedTouches
+    for (let t of touches)
+    {
+        ongoingTouches.push(copyTouch(t))
+    }
+  }
+
+  function handleMove(evt)
+  {
+      evt.preventDefault()
+      let touches = evt.changedTouches
+      for (let t of touches)
+      {
+            // find touch ID
+            let idx = ongoingTouchIndexById(t.identifier)
+            // swap in the new touch record if found
+            if (idx >= 0) ongoingTouches.splice(idx, 1, copyTouch(t))  
+      }
+      //logTouches()
+      //console.log(ongoingTouches)
+  }
+
+  function handleEnd(evt)
+  {
+      evt.preventDefault()
+      let touches = evt.changedTouches
+      for (let t of touches)
+      {
+            // find Touch ID
+            let idx = ongoingTouchIndexById(t.identifier)
+            // remove it; we're done
+            if (idx >= 0) ongoingTouches.splice(idx, 1)
+      }
+  }
+
+  function handleCancel(evt)
+  {
+      evt.preventDefault()
+    let touches = evt.changedTouches
+    for (let t of touches)
+    {
+        let idx = ongoingTouchIndexById(t.identifier)
+        if (idx >= 0) ongoingTouches.splice(idx, 1)
+    }
+  }
+
+  function getColor(r, g, b, a)
+  {
+      let out = 'rgba('
+      out += r
+      out += ','
+      out += g
+      out += ','
+      out += b
+      out += ','
+      out += a
+      out += ')'
+      return out
+      //return 'rgba(' + r ',' + g + ',' + b + ',' + a + ')'
+  }
+
+  function handleCancel(evt) {
+    evt.preventDefault()
+    console.log("touchcancel.")
+    var touches = evt.changedTouches
+  
+    for (var i = 0; i < touches.length; i++) {
+      var idx = ongoingTouchIndexById(touches[i].identifier)
+      ongoingTouches.splice(idx, 1)  // remove it; we're done
+    }
+  }
+
+  function copyTouch({ identifier, pageX, pageY }) {
+    return { identifier, x: pageX, y: pageY }
+  }
+
+  function getTouchByID(id)
+  {
+      for (let t of ongoingTouches)
+      {
+          if (t.identifier === id) return t
+      }
+      return null
+  }
+  function ongoingTouchIndexById(idToFind) {
+    for (var i = 0; i < ongoingTouches.length; i++) {
+      var id = ongoingTouches[i].identifier
+  
+      if (id == idToFind) {
+        return i
+      }
+    }
+    return -1    // not found
+  }
+
+</script>
+
+</body>
+</html>
