@@ -20,6 +20,8 @@ WebsocketsClient client;
 #define L_PWM D3
 #define R_PWM D4
 
+#define MAXSPEED 100
+
 // ENCODER
 #define SS1   D8
 #define SS2   D7

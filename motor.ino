@@ -28,8 +28,9 @@ void brake()
   analogWrite(L_PWM, 0);
   analogWrite(R_PWM, 0);
 }
-void driveMotor(int spd)
+void driveMotor(int _spd)
 {
+  int spd = map(_spd, -MAXSPEED, MAXSPEED);
   enableMotor();
   if (spd == 0) {
     brake();
